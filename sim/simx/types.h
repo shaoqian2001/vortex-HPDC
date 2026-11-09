@@ -149,7 +149,8 @@ enum class LsuType {
   TCU_LOAD,
   STORE,
   TCU_STORE,
-  FENCE
+  FENCE,
+  PREFETCH
 };
 
 enum class TCUType {

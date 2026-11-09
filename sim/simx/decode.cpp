@@ -403,10 +403,15 @@ static const char* op_string(const Instr &instr) {
       default:
         std::abort();
       }
+    case 5:
+      switch (func3) {
+      case 0: return "prefetch";
+      default:
+        std::abort();
+      }
     default:
       std::abort();
     }
-  
   case Opcode::TCU:
     switch(func3)
     {

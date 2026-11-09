@@ -400,7 +400,7 @@ module VX_socket_mini_axi import VX_gpu_pkg::*; #(
         .NC_ENABLE      (1),
         .CORE_OUT_BUF   (3),
         .MEM_OUT_BUF    (2),
-        .ENABLE_HPDCACHE (`ENABLE_HPDCACHE)
+        .ENABLE_HPDCACHE (`L1_HPDC_ENABLED)
     ) dcache (
     `ifdef PERF_ENABLE
         .cache_perf     (mem_perf_tmp_if.dcache),

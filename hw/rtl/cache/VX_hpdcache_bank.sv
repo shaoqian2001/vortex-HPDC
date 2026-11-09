@@ -16,7 +16,8 @@
 
 module VX_hpdcache
     import VX_gpu_pkg::*;
-    import hpdcache_pkg::*; 
+    import hpdcache_pkg::*;
+    import fetchflare_pkg::*;
 #(
     parameter `STRING INSTANCE_ID   = "",
 
@@ -33,11 +34,11 @@ module VX_hpdcache
     parameter NUM_WAYS              = 4,
     // Size of a word in bytes
     parameter WORD_SIZE             = 16,
-
     // Core Response Queue Size
     parameter CRSQ_SIZE             = 4,
     // Miss Reserv Queue Knob
     parameter MSHR_SIZE             = 16,
+    parameter MSHR_SETS             = 1,
     // Memory Response Queue Size
     parameter MRSQ_SIZE             = 4,
     // Memory Request Queue Size
@@ -68,7 +69,9 @@ module VX_hpdcache
     parameter CORE_OUT_BUF          = 3,
 
     // Memory request output register
-    parameter MEM_OUT_BUF           = 3
+    parameter MEM_OUT_BUF           = 3,
+
+    parameter NUM_HWPF              = 0
  ) (
     // PERF
 `ifdef PERF_ENABLE
@@ -80,6 +83,20 @@ module VX_hpdcache
 
     VX_mem_bus_if.slave     core_bus_if [NUM_REQS],
     VX_mem_bus_if.master    mem_bus_if
+
+// `ifdef HWPF_ENABLE
+//     //  Hardware memory prefetcher configuration
+//     input  logic [NrHwPrefetchers-1:0]       hwpf_base_set_i,
+//     input  logic [NrHwPrefetchers-1:0][63:0] hwpf_base_i,
+//     output logic [NrHwPrefetchers-1:0][63:0] hwpf_base_o,
+//     input  logic [NrHwPrefetchers-1:0]       hwpf_param_set_i,
+//     input  logic [NrHwPrefetchers-1:0][63:0] hwpf_param_i,
+//     output logic [NrHwPrefetchers-1:0][63:0] hwpf_param_o,
+//     input  logic [NrHwPrefetchers-1:0]       hwpf_throttle_set_i,
+//     input  logic [NrHwPrefetchers-1:0][63:0] hwpf_throttle_i,
+//     output logic [NrHwPrefetchers-1:0][63:0] hwpf_throttle_o,
+//     output logic [               63:0]       hwpf_status_o
+// `endif
 );
 
     `STATIC_ASSERT(NUM_BANKS == (1 << `CLOG2(NUM_BANKS)), ("invalid parameter: number of banks must be power of 2"))
@@ -115,6 +132,24 @@ module VX_hpdcache
 
     localparam REQ_XBAR_BUF = (NUM_REQS > 4) ? 2 : 0;
 
+    // HPDC parameters
+    // for HPC workload, set word width to 64 bits
+    localparam HPDC_WORD_SIZE = 8;
+    localparam HPDC_WORD_WIDTH = 64;
+    localparam HPDC_CL_WORD = LINE_SIZE / HPDC_WORD_SIZE;
+    localparam HPDC_REQ_WORD = WORD_WIDTH / HPDC_WORD_WIDTH;
+    localparam HPDC_ACCESS_WORD = HPDC_CL_WORD;
+
+    localparam int unsigned INDEX_WIDTH = $bits(HPDcacheCfg.reqOffsetWidth);
+    localparam int unsigned BLOCK_OFFSET_WIDTH = $clog2(64);
+    localparam int unsigned ADDR_WIDTH = INDEX_WIDTH + TAG_WIDTH;
+    localparam type hpdcache_req_addr_t = logic [INDEX_WIDTH+TAG_WIDTH-1 : 0];
+
+    localparam int HPDC_NREQ = NUM_HWPF > 0 ? NUM_REQS + 1 : NUM_REQS; // one extra requester for hwpf
+
+    // HPDC type definitions
+    typedef logic [HPDcacheCfg.nlineWidth-1:0] hpdcache_nline_t;
+    typedef logic [HPDcacheCfg.setWidth-1:0] hpdcache_set_t;
 
 // performance monitoring and tracking
 `ifdef PERF_ENABLE
@@ -128,17 +163,93 @@ module VX_hpdcache
 
     // if there is flush request
     logic [NUM_REQS-1:0] flush_req_valid;
-    logic dcache_flush;
+    wire dcache_flush;
 
     // one or more of the requesters issue a flush request
-    assign dcache_flush = flush_req_valid != 0;
+    assign dcache_flush = | flush_req_valid;
     
     
-    logic dcache_read_miss, dcache_write_miss, dcache_refill_stall;
+    logic dcache_read_miss, dcache_write_miss;
+    logic dcache_refill_stall, dcache_stall;
     logic dcache_read_req, dcache_write_req;
+    logic dcache_mshr_full;
+    logic rtab_full;
+    logic wbuf_full;
 
 
+    // flush state machine
+    // 0: idle, 1: flush
+
+    // localparam FLUSH_IDLE  = 0;
+    // localparam FLUSH_BEGIN = 1;
+    // localparam FLUSH_WAIT  = 2;
+
+    // localparam FLUSH_RSP = 3;
+    // localparam FLUSH_DONE = 4;
+
+    // typedef enum logic [1:0] {
+    //     FLUSH_IDLE  = 2'b00,
+    //     FLUSH_BEGIN = 2'b01,
+    //     FLUSH_WAIT  = 2'b10,
+    //     FLUSH_DONE  = 2'b11
+    // } flush_state_t;
+
+    // // flush state machine
+    // reg flush_state, flush_state_n;
+
+    // always_comb begin
+    //     flush_state_n = flush_state;
+    //     case (flush_state)
+    //         FLUSH_IDLE: begin
+    //             if (dcache_flush) begin
+    //                 flush_state_n = FLUSH_BEGIN;
+    //             end 
+    //         end
+    //         FLUSH_BEGIN: begin
+    //             if (flush_req_valid[0]) begin // assume only one requester for now
+    //                 flush_state_n = FLUSH_WAIT;
+    //             end
+    //         end
+    //         FLUSH_WAIT: begin
+    //             if (!dcache_flush) begin
+    //                 flush_state_n = FLUSH_DONE;
+    //             end
+    //         end
+    //         FLUSH_DONE: begin
+    //             flush_state_n = FLUSH_IDLE;
+    //         end
+    //     endcase
+    // end
+
+
+    // always_ff @(posedge clk or negedge reset) begin
+    //     if (!reset) begin
+    //         flush_state <= FLUSH_IDLE;
+    //     end else begin
+    //         flush_state <= flush_state_n;
+    //     end
+    // end
+
+    // // output
+    // always_comb begin
     
+
+
+    // end
+
+
+
+    // always_ff @(posedge clk or negedge reset) begin
+    //     if (!reset) begin
+    //         flush_state <= 0;
+    //     end else begin
+    //         if (dcache_flush) begin
+    //             flush_state <= 1;
+    //         end else if (flush_state) begin
+    //             flush_state <= 0;
+    //         end
+    //     end
+    // end
 
 
     // VX_mem_bus_if #(
@@ -241,26 +352,37 @@ module VX_hpdcache
 
 
 
+// generate
+//     $error("line size: %0d", LINE_SIZE);
+//     $error("word size: %0d", WORD_SIZE);
+
+
+// endgenerate
+
+
 localparam int HPDCACHE_NREQUESTERS = 1;   //
 
 // hpcache
     localparam hpdcache_pkg::hpdcache_user_cfg_t HPDcacheUserCfg = '{
         // HPDCache configuration for Vortex GPU
         // Core parameters
-        nRequesters: NUM_REQS,  // should be set as NUMBER of INPUT of Vortex_cache_cluster, set to 1 for test
+        nRequesters: HPDC_NREQ,  // should be set as NUMBER of INPUT of Vortex_cache_cluster, set to 1 for test
+        // nBanks: NUM_BANKS,  // From Vortex NUM_BANKS
         paWidth: int'(`MEM_ADDR_WIDTH),  // From Vortex MEM_ADDR_WIDTH, 
-        wordWidth: int'(`CS_WORD_WIDTH),  // From Vortex CS_WORD_WIDTH (8 * WORD_SIZE)
+        wordWidth: int'(HPDC_WORD_WIDTH),  // From Vortex CS_WORD_WIDTH (8 * WORD_SIZE)
         sets: int'(`CS_LINES_PER_BANK),  // CACHE_SIZE / (LINE_SIZE * NUM_WAYS) for NUMBANK = 1
         ways: int'(NUM_WAYS),  // From Vortex NUM_WAYS
-        clWords: int'(`CS_WORDS_PER_LINE),  // From Vortex CS_WORDS_PER_LINE (LINE_SIZE/WORD_SIZE)
-        reqWords: int'(1),  // Single word requests
+        clWords: int'(HPDC_CL_WORD),  // From Vortex CS_WORDS_PER_LINE (LINE_SIZE/WORD_SIZE)
+        reqWords: int'(HPDC_REQ_WORD),  // Single word requests
 
         // Request tracking
         reqTransIdWidth: int'(TAG_WIDTH),  // core request tag width
-        reqSrcIdWidth: int'(`UP(`CS_REQ_SEL_BITS)),  // `CLOG2(NUM_REQS)
+        reqSrcIdWidth: int'(`UP(`CLOG2(HPDC_NREQ))),  // `CLOG2(HPDC_NREQ)
 
         // Cache organization
-        victimSel: (REPL_POLICY == `CS_REPL_PLRU) ? hpdcache_pkg::HPDCACHE_VICTIM_PLRU :  // hpdcache does not support cyclic
+        victimSel: (REPL_POLICY == `CS_REPL_PLRU) ? hpdcache_pkg::HPDCACHE_VICTIM_PLRU :
+                    (REPL_POLICY == `CS_REPL_CYCLIC) ? hpdcache_pkg::HPDCACHE_VICTIM_CYCLIC :
+                    (REPL_POLICY == `CS_REPL_RRIP) ? hpdcache_pkg::HPDCACHE_VICTIM_RRIP :
                                                     hpdcache_pkg::HPDCACHE_VICTIM_RANDOM,
 
         // Data RAM configuration
@@ -268,7 +390,7 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
         dataWaysPerRamWord: int'(2),
         dataSetsPerRam: int'(`CS_LINES_PER_BANK),
         dataRamByteEnable: bit'(1'b1),
-        accessWords: int'(__maxu(`CS_WORDS_PER_LINE / 2, 1)),
+        accessWords: int'(__maxu(HPDC_CL_WORD / 2, HPDC_REQ_WORD)),
         //accessWords: int'(4)
 
         // MSHR configuration
@@ -277,25 +399,35 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
         // mshrWaysPerRamWord: int'((MSHR_SIZE < 16) ? MSHR_SIZE : 2),
         // mshrSetsPerRam: int'((MSHR_SIZE < 16) ? 1 : MSHR_SIZE / 2),
        
-        mshrSets: int'(1),
-        mshrWays: int'(MSHR_SIZE),
-        mshrWaysPerRamWord: int'(MSHR_SIZE),
-        mshrSetsPerRam: int'(1),
+
+        // mshrSets: int'(4),
+        // mshrWays: int'(MSHR_SIZE / 4),
+        // mshrWaysPerRamWord: int'(MSHR_SIZE / 4),
+        // mshrSetsPerRam: int'(4),
+        mshrSets: int'(`DCACHE_MSHR_SET),
+        mshrWays: int'(MSHR_SIZE / `DCACHE_MSHR_SET),
+        mshrWaysPerRamWord: int'(MSHR_SIZE / `DCACHE_MSHR_SET),
+        mshrSetsPerRam: int'(`DCACHE_MSHR_SET),
         mshrRamByteEnable: bit'(1'b1),
-        mshrUseRegbank: bit'(MSHR_SIZE < 16),
+        //mshrUseRegbank: bit'(MSHR_SIZE < 16),
+        mshrUseRegbank: bit'(1'b1),   // use regbank for MSHR
+        
+        cbufEntries: int'(4),
 
         // Core response handling
         refillCoreRspFeedthrough: bit'(1'b1),
-        refillFifoDepth: int'(2),
+        refillFifoDepth: int'(MRSQ_SIZE),
 
         // Write buffer configuration
-        wbufDirEntries: int'(MREQ_SIZE),  // From Vortex MREQ_SIZE
-        wbufDataEntries: int'(MREQ_SIZE), 
-        wbufWords: int'(1),
+        //wbufDirEntries: int'(MREQ_SIZE),  // From Vortex MREQ_SIZE
+        //wbufDataEntries: int'(MREQ_SIZE), 
+        wbufDirEntries: int'(16),  // From Vortex MREQ_SIZE
+        wbufDataEntries: int'(8), 
+        wbufWords: int'(`CS_LINE_WIDTH / WORD_WIDTH),   // mem bus width / core request word width, e.g., 512/256 = 2
         wbufTimecntWidth: int'(3),
 
         // Request tracking
-        rtabEntries: int'(4),
+        rtabEntries: int'(MSHR_SIZE-NUM_WAYS), // set replay table size to number of threads
 
         // Flush handling
         flushEntries: 8,
@@ -308,8 +440,9 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
 
         // Write policies
         wtEn: bit'(WRITE_ENABLE),  // From Vortex WRITE_ENABLE
-        wbEn: bit'(WRITEBACK)    // From Vortex WRITEBACK
+        wbEn: bit'(WRITEBACK),    // From Vortex WRITEBACK
 
+        lowLatency: bit'(1'b1)
     };
 
 
@@ -318,7 +451,7 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
   initial begin
     $display("HPDcache Configuration:");
     $display("  nRequesters: %0d", HPDcacheUserCfg.nRequesters);
-    $display("  nBanks: %0d", HPDcacheUserCfg.nBanks);
+    // $display("  nBanks: %0d", HPDcacheUserCfg.nBanks);
     $display("  paWidth: %0d", HPDcacheUserCfg.paWidth);
     $display("  wordWidth: %0d", HPDcacheUserCfg.wordWidth);
     $display("  sets: %0d", HPDcacheUserCfg.sets);
@@ -352,6 +485,14 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
     $display("  memDataWidth: %0d", HPDcacheUserCfg.memDataWidth);
     $display("  wtEn: %0d", HPDcacheUserCfg.wtEn);
     $display("  wbEn: %0d", HPDcacheUserCfg.wbEn);
+    $display("  lowLatency: %0d", HPDcacheUserCfg.lowLatency);
+    // prefetcher config
+    if (NUM_HWPF > 0) begin
+        $display("  HPDcache prefetcher page size: %0d", hpdc_prefetcher_page_size);
+        $display("  HPDcache prefetcher cachelines: %0d", hpdc_prefetcher_cachelines);
+        $display("  HPDcache prefetcher inflight: %0d", hpdc_prefetcher_inflight);
+        $display("  HPDcache prefetcher wait: %0d", hpdc_prefetcher_wait);
+    end
   end
 
 
@@ -361,13 +502,26 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
       HPDcacheUserCfg
     );
 
-    `STATIC_ASSERT(HPDcacheCfg.u.wordWidth < 0, ("wordwidth: %0d", HPDcacheCfg.u.wordWidth))
-    `STATIC_ASSERT(HPDcacheUserCfg.wordWidth < 0, ("user: wordwidth: %0d", HPDcacheUserCfg.wordWidth))
-    `STATIC_ASSERT(HPDcacheUserCfg.accessWords < 0, ("user: accesswords: %0d", HPDcacheUserCfg.accessWords))
-    `STATIC_ASSERT(HPDcacheUserCfg.paWidth < 0, ("pawidth: %0d", HPDcacheCfg.u.paWidth))
-    `STATIC_ASSERT(HPDcacheUserCfg.memAddrWidth < 0, ("memAddrwidth: %0d", HPDcacheCfg.u.memAddrWidth))
-    `STATIC_ASSERT(NUM_BANKS < 0, ("numbanks: %0d", NUM_BANKS))
-    `STATIC_ASSERT(HPDcacheUserCfg.clWords < 0, ("clwords: %0d", HPDcacheUserCfg.clWords))
+
+    // `STATIC_ASSERT(HPDcacheCfg.clWordIdxWidth > 0, ("instance id: %s", INSTANCE_ID));
+    // `STATIC_ASSERT(HPDcacheCfg.clWordIdxWidth > 0, ("write-back: %0d", WRITEBACK));
+    // `STATIC_ASSERT(HPDcacheCfg.clWordIdxWidth > 0, ("line size: %0d", LINE_SIZE));
+    // `STATIC_ASSERT(HPDcacheCfg.clWordIdxWidth > 0, ("word size: %0d", WORD_SIZE));
+    // `STATIC_ASSERT(HPDcacheCfg.clWordIdxWidth > 0, ("word width: %0d", HPDcacheCfg.u.wordWidth));
+    // `STATIC_ASSERT(HPDcacheCfg.clWordIdxWidth > 0, ("clword: %0d", HPDcacheCfg.u.clWords));
+    // `STATIC_ASSERT(HPDcacheCfg.clWordIdxWidth > 0, ("clWordIdxWidth: %0d", HPDcacheCfg.clWordIdxWidth));
+
+
+
+    // `STATIC_ASSERT(HPDcacheCfg.u.wordWidth < 0, ("wordwidth: %0d", HPDcacheCfg.u.wordWidth))
+    // `STATIC_ASSERT(LINE_SIZE < 0, ("linesize: %0d", LINE_SIZE))
+    // `STATIC_ASSERT(write < 0, ("sets: %0d", HPDcacheCfg.u.sets))
+    // `STATIC_ASSERT(HPDcacheUserCfg.wordWidth < 0, ("user: wordwidth: %0d", HPDcacheUserCfg.wordWidth))
+    // `STATIC_ASSERT(HPDcacheUserCfg.accessWords < 0, ("user: accesswords: %0d", HPDcacheUserCfg.accessWords))
+    // `STATIC_ASSERT(HPDcacheUserCfg.paWidth < 0, ("pawidth: %0d", HPDcacheCfg.u.paWidth))
+    // `STATIC_ASSERT(HPDcacheUserCfg.memAddrWidth < 0, ("memAddrwidth: %0d", HPDcacheCfg.u.memAddrWidth))
+    // `STATIC_ASSERT(NUM_BANKS < 0, ("numbanks: %0d", NUM_BANKS))
+    // `STATIC_ASSERT(HPDcacheUserCfg.clWords < 0, ("clwords: %0d", HPDcacheUserCfg.clWords))
 
     // generate type definitions
 
@@ -389,29 +543,42 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
 
     typedef logic [HPDcacheCfg.u.wbufTimecntWidth-1:0] hpdcache_wbuf_timecnt_t;
 
-    // if adapter for load/store core request/response
+
 
 
     // hardware prefetcher
-    typedef logic [63:0] hwpf_stride_param_t;
+    // typedef logic [63:0] hwpf_stride_param_t;
 
-    logic                        dcache_req_valid[HPDCACHE_NREQUESTERS];
-    logic                        dcache_req_ready[HPDCACHE_NREQUESTERS];
-    hpdcache_req_t               dcache_req      [HPDCACHE_NREQUESTERS];
-    logic                        dcache_req_abort[HPDCACHE_NREQUESTERS];
-    hpdcache_tag_t               dcache_req_tag  [HPDCACHE_NREQUESTERS];
-    hpdcache_pkg::hpdcache_pma_t dcache_req_pma  [HPDCACHE_NREQUESTERS];
-    logic                        dcache_rsp_valid[HPDCACHE_NREQUESTERS];
-    hpdcache_rsp_t               dcache_rsp      [HPDCACHE_NREQUESTERS];
+
+    // logic                                   [                2:0] snoop_valid;
+    // logic                                   [                2:0] snoop_abort;
+    // hpdcache_req_offset_t                   [                2:0] snoop_addr_offset;
+    // hpdcache_tag_t                          [                2:0] snoop_addr_tag;
+    // logic                                   [                2:0] snoop_phys_indexed;
+
+    // logic                                                         dcache_cmo_req_is_prefetch;
+
+    // hwpf_stride_pkg::hwpf_stride_throttle_t [NrHwPrefetchers-1:0] hwpf_throttle_in;
+    // hwpf_stride_pkg::hwpf_stride_throttle_t [NrHwPrefetchers-1:0] hwpf_throttle_out;
+
+
+
+    logic                        dcache_req_valid[HPDC_NREQ];
+    logic                        dcache_req_ready[HPDC_NREQ];
+    hpdcache_req_t               dcache_req      [HPDC_NREQ];
+    logic                        dcache_req_abort[HPDC_NREQ];
+    hpdcache_tag_t               dcache_req_tag  [HPDC_NREQ];
+    hpdcache_pkg::hpdcache_pma_t dcache_req_pma  [HPDC_NREQ];
+    logic                        dcache_rsp_valid[HPDC_NREQ];
+    hpdcache_rsp_t               dcache_rsp      [HPDC_NREQ];
     logic                        evt_hpdc_read_miss, evt_hpdc_write_miss;
 
 
-    logic dcache_enable;
-
-    // turn on by default
-    assign dcache_enable = 1'b1;
+    logic dcache_enable = 1'b1;
 
 
+
+    // if adapter for load/store core request/response
     generate
         for (genvar r = 0; r < NUM_REQS; ++r) begin : gen_vx_hpdcache_if_adapter
             VX_hpdcache_core_if_adapter #(
@@ -429,7 +596,8 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
             .LINE_SIZE            (LINE_SIZE),
             .NUM_BANKS            (NUM_BANKS),
             .NUM_WAYS             (NUM_WAYS),
-            .WORD_SIZE            (WORD_SIZE)
+            .WORD_SIZE            (WORD_SIZE),
+            .WRITEBACK            (WRITEBACK)
         ) i_vx_hpdcache_if_adapter (
             .clk(clk),
             .reset(reset),
@@ -437,7 +605,7 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
             .hpdcache_req_sid_i(hpdcache_req_sid_t'(r)),
 
             .flush_op_o        (flush_req_valid[r]),
-            .vx_core_bus     (core_bus_if [r]),
+            .vx_core_bus       (core_bus_if [r]),
                                 
             .hpdcache_req_valid(dcache_req_valid[r]),
             .hpdcache_req_ready(dcache_req_ready[r]),
@@ -453,6 +621,10 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
     endgenerate
 
     // CMO request generation
+    
+    
+
+
 
 
 
@@ -481,40 +653,194 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
     logic                 dcache_write_resp_valid;
     hpdcache_mem_resp_w_t dcache_write_resp;
 
-    // vx_hpdcache_mem_if_adapter #(
-    //     .hpdcache_mem_id_t    (hpdcache_mem_id_t),
-    //     .hpdcache_mem_req_t   (hpdcache_mem_req_t),
-    //     .hpdcache_mem_req_w_t (hpdcache_mem_req_w_t),
-    //     .hpdcache_mem_resp_r_t(hpdcache_mem_resp_r_t),
-    //     .hpdcache_mem_resp_w_t(hpdcache_mem_resp_w_t),
-    // ) i_vx_hpdcache_mem_if_adapter (
-    //     .clk_i,
-    //     .rst_ni,
+  // //  Hardware memory prefetcher configuration
+  //   input  logic [NrHwPrefetchers-1:0]       hwpf_base_set_i,
+  //   input  logic [NrHwPrefetchers-1:0][63:0] hwpf_base_i,
+  //   output logic [NrHwPrefetchers-1:0][63:0] hwpf_base_o,
+  //   input  logic [NrHwPrefetchers-1:0]       hwpf_param_set_i,
+  //   input  logic [NrHwPrefetchers-1:0][63:0] hwpf_param_i,
+  //   output logic [NrHwPrefetchers-1:0][63:0] hwpf_param_o,
+  //   input  logic [NrHwPrefetchers-1:0]       hwpf_throttle_set_i,
+  //   input  logic [NrHwPrefetchers-1:0][63:0] hwpf_throttle_i,
+  //   output logic [NrHwPrefetchers-1:0][63:0] hwpf_throttle_o,
+  //   output logic [               63:0]       hwpf_status_o,
 
-    //     // memory request signals
-    //     .mem_bus_if    (mem_bus_if),
+//   hwpf_stride_wrapper #(
+//       .HPDcacheCfg          (HPDcacheCfg),
+//       .NUM_HW_PREFETCH      (NrHwPrefetchers),
+//       .NUM_SNOOP_PORTS      (3),
+//       .hpdcache_tag_t       (hpdcache_tag_t),
+//       .hpdcache_req_offset_t(hpdcache_req_offset_t),
+//       .hpdcache_req_data_t  (hpdcache_req_data_t),
+//       .hpdcache_req_be_t    (hpdcache_req_be_t),
+//       .hpdcache_req_sid_t   (hpdcache_req_sid_t),
+//       .hpdcache_req_tid_t   (hpdcache_req_tid_t),
+//       .hpdcache_req_t       (hpdcache_req_t),
+//       .hpdcache_rsp_t       (hpdcache_rsp_t)
+//   ) i_hwpf_stride_wrapper (
+//       .clk_i,
+//       .rst_ni,
 
-    //     .mem_req_read_ready(dcache_read_ready),
-    //     .mem_req_read_valid(dcache_read_valid),
-    //     .mem_req_read      (dcache_read),
+//       .hwpf_stride_base_set_i    (hwpf_base_set_i),
+//       .hwpf_stride_base_i        (hwpf_base_i),
+//       .hwpf_stride_base_o        (hwpf_base_o),
+//       .hwpf_stride_param_set_i   (hwpf_param_set_i),
+//       .hwpf_stride_param_i       (hwpf_param_i),
+//       .hwpf_stride_param_o       (hwpf_param_o),
+//       .hwpf_stride_throttle_set_i(hwpf_throttle_set_i),
+//       .hwpf_stride_throttle_i    (hwpf_throttle_in),
+//       .hwpf_stride_throttle_o    (hwpf_throttle_out),
+//       .hwpf_stride_status_o      (hwpf_status_o),
 
-    //     .mem_resp_read_ready(dcache_read_resp_ready),
-    //     .mem_resp_read_valid(dcache_read_resp_valid),
-    //     .mem_resp_read      (dcache_read_resp),
+//       .snoop_valid_i       (snoop_valid),
+//       .snoop_abort_i       (snoop_abort),
+//       .snoop_addr_offset_i (snoop_addr_offset),
+//       .snoop_addr_tag_i    (snoop_addr_tag),
+//       .snoop_phys_indexed_i(snoop_phys_indexed),
 
-    //     .mem_req_write_ready(dcache_write_ready),
-    //     .mem_req_write_valid(dcache_write_valid),
-    //     .mem_req_write      (dcache_write),
+//       .hpdcache_req_sid_i(hpdcache_req_sid_t'(NUM_REQS)),
 
-    //     .mem_req_write_data_ready(dcache_write_data_ready),
-    //     .mem_req_write_data_valid(dcache_write_data_valid),
-    //     .mem_req_write_data      (dcache_write_data),
+//       .hpdcache_req_valid_o(dcache_req_valid[NUM_REQS]),
+//       .hpdcache_req_ready_i(dcache_req_ready[NUM_REQS]),
+//       .hpdcache_req_o      (dcache_req[NUM_REQS]),
+//       .hpdcache_req_abort_o(dcache_req_abort[NUM_REQS]),
+//       .hpdcache_req_tag_o  (dcache_req_tag[NUM_REQS]),
+//       .hpdcache_req_pma_o  (dcache_req_pma[NUM_REQS]),
+//       .hpdcache_rsp_valid_i(dcache_rsp_valid[NUM_REQS]),
+//       .hpdcache_rsp_i      (dcache_rsp[NUM_REQS])
+//   );
 
-    //     .mem_resp_write_ready(dcache_write_resp_ready),
-    //     .mem_resp_write_valid(dcache_write_resp_valid),
-    //     .mem_resp_write      (dcache_write_resp),
 
-    // );
+
+
+
+    logic [12:0] hpdc_prefetcher_page_size_csr;
+    logic [15:0] hpdc_prefetcher_cachelines_csr;
+    logic [15:0]  hpdc_prefetcher_inflight_csr;
+    logic [15:0]  hpdc_prefetcher_wait_csr;
+    logic         hpdc_prefetcher_csr_update_valid;
+
+    // combinational logic for prefetcher parameters
+    logic [12:0] hpdc_prefetcher_page_size;
+    logic [15:0] hpdc_prefetcher_cachelines;
+    logic [15:0] hpdc_prefetcher_inflight;
+    logic [15:0] hpdc_prefetcher_wait;
+
+    //page size of the main memory
+    assign hpdc_prefetcher_page_size   = `MEM_PAGE_SIZE;
+    
+    // how many cachelines can prefetch run within the limit of current memory page = 1/4 cache lines in a page
+    assign hpdc_prefetcher_cachelines   =  `MEM_PAGE_SIZE / LINE_SIZE / 4;
+    
+    // limit of in-flight prefetch requests (that are not yet returned)
+    assign hpdc_prefetcher_inflight     =   MSHR_SIZE / 2;
+    
+    // number of cycles to wait between two prefetch requests
+    assign hpdc_prefetcher_wait         = 4;
+
+    
+
+generate
+    if (NUM_HWPF > 0) begin : g_hw_prefetcher
+
+    always @(posedge clk or negedge reset) begin
+        if (!reset) begin
+            hpdc_prefetcher_page_size_csr    <= hpdc_prefetcher_page_size;
+            hpdc_prefetcher_cachelines_csr   <= hpdc_prefetcher_cachelines;
+            hpdc_prefetcher_inflight_csr     <= hpdc_prefetcher_inflight;
+            hpdc_prefetcher_wait_csr         <= hpdc_prefetcher_wait;
+            hpdc_prefetcher_csr_update_valid      <= 1'b1;
+        end else begin
+            // CSR write logic can be added here
+            // compare the csr and input values, if different, update the csr and generate valid signal
+            hpdc_prefetcher_csr_update_valid      <= (hpdc_prefetcher_page_size_csr    != hpdc_prefetcher_page_size)    ||
+                                                (hpdc_prefetcher_cachelines_csr   != hpdc_prefetcher_cachelines)   ||
+                                                (hpdc_prefetcher_inflight_csr     != hpdc_prefetcher_inflight)     ||
+                                                (hpdc_prefetcher_wait_csr         != hpdc_prefetcher_wait);
+            hpdc_prefetcher_page_size_csr    <= hpdc_prefetcher_page_size;
+            hpdc_prefetcher_cachelines_csr   <= hpdc_prefetcher_cachelines;
+            hpdc_prefetcher_inflight_csr     <= hpdc_prefetcher_inflight;
+            hpdc_prefetcher_wait_csr         <= hpdc_prefetcher_wait;
+        end
+    end
+
+
+    /*
+    Currently FetchFlare only look at the 0th snoop port
+    so we time multiplex all the requester to the 0th port
+    this is ok because currently the cache can only handle one requester per cycle (including the prefetcher)
+    if multi-banking is supported by the cache in the future, this must be changed as well
+    */
+    hpdcache_req_addr_t dcache_req_addr[NUM_REQS];
+
+    for (genvar i = 0; i < NUM_REQS; ++i) begin : g_dcache_req_addr_extract
+        assign dcache_req_addr[i] = {dcache_req[i].addr_tag, dcache_req[i].addr_offset};
+    end
+
+    logic prefetch_snoop_valid;
+    hpdcache_req_addr_t prefetch_snoop_addr;
+
+
+    always_comb begin
+        prefetch_snoop_valid = 1'b0;
+        for (int j = 0; j < NUM_REQS; ++j) begin
+            // only snoop when it is load request
+            if (dcache_req_valid[j] && dcache_req_ready[j] && dcache_req[j].op == hpdcache_pkg::HPDCACHE_REQ_LOAD) begin
+                prefetch_snoop_valid = 1'b1;
+                break;
+            end
+        end
+    end
+
+    // select the address line according to the valid requester's index
+    always_comb begin
+        prefetch_snoop_addr = '0;
+        for (int j = 0; j < NUM_REQS; ++j) begin
+            if (dcache_req_valid[j] && dcache_req_ready[j]) begin
+                prefetch_snoop_addr = dcache_req_addr[j];
+            end
+        end
+    end
+
+    fetchflare_wrapper #(
+        .NUM_HW_PREFETCH(NUM_HWPF),
+        .NUM_SNOOP_PORTS(1),
+        .CACHE_LINE_BYTES(LINE_SIZE),
+        .hpdcache_tag_t       (hpdcache_tag_t),
+        .hpdcache_req_offset_t(hpdcache_req_offset_t),
+        .hpdcache_req_data_t  (hpdcache_req_data_t),
+        .hpdcache_req_be_t    (hpdcache_req_be_t),
+        .hpdcache_req_sid_t   (hpdcache_req_sid_t),
+        .hpdcache_req_tid_t   (hpdcache_req_tid_t),
+        .hpdcache_req_t       (hpdcache_req_t),
+        .hpdcache_rsp_t       (hpdcache_rsp_t),
+        .hpdcache_nline_t     (hpdcache_nline_t),
+        .hpdcache_set_t       (hpdcache_set_t)
+    ) i_fetchflare_wrapper (
+        .clk_i(clk),
+        .rst_ni(reset),
+        .hwpf_stride_base_o              (/* unused */),
+        .hpdc_valid_i                    (hpdc_prefetcher_csr_update_valid),
+        .hpdc_prefetcher_cachelines_i    (hpdc_prefetcher_cachelines_csr),
+        .hpdc_prefetcher_inflight_i      (hpdc_prefetcher_inflight_csr),
+        .hpdc_prefetcher_wait_i          (hpdc_prefetcher_wait_csr),
+        .hpdc_prefetcher_page_size_i     (hpdc_prefetcher_page_size_csr),
+
+        .snoop_valid_i  (prefetch_snoop_valid),
+        .snoop_addr_i   (prefetch_snoop_addr),
+
+        .hpdcache_req_sid_i   (hpdcache_req_sid_t'(NUM_REQS)),
+
+        .hpdcache_req_valid_o (dcache_req_valid[NUM_REQS]),
+        .hpdcache_req_ready_i (dcache_req_ready[NUM_REQS]),
+        .hpdcache_req_o       (dcache_req[NUM_REQS]),
+        .hpdcache_rsp_valid_i (dcache_rsp_valid[NUM_REQS]),
+        .hpdcache_rsp_i       (dcache_rsp[NUM_REQS])
+    );
+    end
+endgenerate
+
+
 
     hpdcache #(
       .HPDcacheCfg          (HPDcacheCfg),
@@ -583,7 +909,10 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
       .evt_req_on_hold_o     (  /* unused */),
       .evt_rtab_rollback_o   (  /* unused */),
       .evt_stall_refill_o    (dcache_refill_stall),
-      .evt_stall_o           (  /* unused */),
+      .evt_stall_o           (dcache_stall),
+      .evt_mshr_full_o       (dcache_mshr_full),
+      .evt_rtab_full_o       (rtab_full),
+      .evt_wbuf_full_o       (wbuf_full),
 
       .wbuf_empty_o(wbuffer_empty_o),
 
@@ -671,6 +1000,10 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
     // end
 
 `ifdef PERF_ENABLE
+    // track hit and miss latency
+    
+
+
     // per cycle: core_reads, core_writes
     wire [`CLOG2(NUM_REQS+1)-1:0] perf_core_reads_per_cycle;
     wire [`CLOG2(NUM_REQS+1)-1:0] perf_core_writes_per_cycle;
@@ -715,6 +1048,8 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
     reg [`PERF_CTR_BITS-1:0] perf_mshr_stalls;
     reg [`PERF_CTR_BITS-1:0] perf_mem_stalls;
     reg [`PERF_CTR_BITS-1:0] perf_crsp_stalls;
+    reg [`PERF_CTR_BITS-1:0] perf_core_stalls;
+    reg [`PERF_CTR_BITS-1:0] perf_wbuf_full;
 
     reg [`PERF_CTR_BITS-1:0] perf_bank_stalls; // bank contention/collision
 
@@ -728,14 +1063,18 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
             perf_mem_stalls   <= '0;
             perf_crsp_stalls  <= '0;
             perf_bank_stalls  <= '0;
+            perf_core_stalls  <= '0;
+            perf_wbuf_full    <= '0;
         end else begin
             perf_core_reads   <= perf_core_reads   + `PERF_CTR_BITS'(perf_core_reads_per_cycle);
             perf_core_writes  <= perf_core_writes  + `PERF_CTR_BITS'(perf_core_writes_per_cycle);
             perf_read_misses  <= perf_read_misses  + `PERF_CTR_BITS'(dcache_read_miss);
             perf_write_misses <= perf_write_misses + `PERF_CTR_BITS'(dcache_write_miss);
-            perf_mshr_stalls  <= perf_mshr_stalls  + `PERF_CTR_BITS'(dcache_refill_stall);
+            perf_mshr_stalls  <= perf_mshr_stalls  + `PERF_CTR_BITS'(rtab_full);
             perf_mem_stalls   <= perf_mem_stalls   + `PERF_CTR_BITS'(perf_mem_stall_per_cycle);
             perf_crsp_stalls  <= perf_crsp_stalls  + `PERF_CTR_BITS'(perf_crsp_stall_per_cycle);
+            perf_core_stalls  <= perf_core_stalls  + `PERF_CTR_BITS'(dcache_stall);
+            perf_wbuf_full    <= perf_wbuf_full    + `PERF_CTR_BITS'(wbuf_full);
         end
     end
 
@@ -747,6 +1086,8 @@ localparam int HPDCACHE_NREQUESTERS = 1;   //
     assign cache_perf.mshr_stalls  = perf_mshr_stalls;
     assign cache_perf.mem_stalls   = perf_mem_stalls;
     assign cache_perf.crsp_stalls  = perf_crsp_stalls;
+    assign cache_perf.core_stalls   = perf_core_stalls;
+    assign cache_perf.wbuf_full      = perf_wbuf_full;
 `endif
 
 endmodule
